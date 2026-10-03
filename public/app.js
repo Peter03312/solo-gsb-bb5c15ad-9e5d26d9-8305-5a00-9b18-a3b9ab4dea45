@@ -92,6 +92,7 @@ function renderAll() {
   renderVerifications();
   renderReservations();
   renderSuspensions();
+  renderRuns();
 }
 
 function renderHoleMax(d) {
@@ -1137,6 +1138,227 @@ async function revokeSuspension(id) {
     showAlert(e.message, 'err');
   }
 }
+
+// ---------- 离心运行 ----------
+
+const RUN_OUTCOME_LABEL = { completed: '完成', aborted: '中止' };
+
+function renderRuns() {
+  // 核验下拉：仅已完成核验（后端还会复核图可用性等条件）
+  const verSel = $('#run-ver');
+  const verList = (state.verifications || []).filter((v) => v.completed);
+  const prevVer = verSel.value;
+  verSel.innerHTML = verList.length
+    ? verList
+        .slice()
+        .reverse()
+        .map(
+          (v) =>
+            `<option value="${v.id}">核验 #${v.id} · 发布图 #${v.publicationId} · ${v.completedAt}</option>`,
+        )
+        .join('')
+    : '<option value="">（暂无已完成核验）</option>';
+  if (verList.some((v) => String(v.id) === prevVer)) verSel.value = prevVer;
+
+  // 预约下拉：全部预约（含已结束/已取消，由后端复核）；标注阶段
+  const resSel = $('#run-res');
+  const resList = (state.reservations || []).slice().reverse();
+  const prevRes = resSel.value;
+  resSel.innerHTML = resList.length
+    ? resList
+        .map(
+          (r) =>
+            `<option value="${r.id}">预约 #${r.id} · ${r.batchNo} · ${PHASE_LABEL[r.phase]} · 图 #${r.publicationId}</option>`,
+        )
+        .join('')
+    : '<option value="">（暂无预约）</option>';
+  if (resList.some((r) => String(r.id) === prevRes)) resSel.value = prevRes;
+
+  const box = $('#run-list');
+  const list = state.runs || [];
+  if (list.length === 0) {
+    box.innerHTML = '<div class="muted">尚无离心运行记录。</div>';
+    return;
+  }
+  box.innerHTML = `<div class="table-wrap"><table class="res-table">
+    <thead><tr>
+      <th>运行编号</th><th>设备</th><th>核验 / 预约 / 发布图</th>
+      <th>开始（服务端，UTC）</th><th>结束（服务端，UTC）</th><th>结果</th>
+      <th>超时</th><th>依据图当前可用</th><th></th>
+    </tr></thead><tbody>${list
+      .map(
+        (r) => `<tr${r.status === 'running' ? '' : ' class="row-stale"'}>
+      <td><button data-run="${r.id}" class="pub-view">${escapeHtml(r.runNo)}</button></td>
+      <td><b>${escapeHtml(r.deviceId)}</b></td>
+      <td class="mono">#${r.verificationId} / #${r.reservationId} / #${r.publicationId}</td>
+      <td class="mono">${r.startUtc}</td>
+      <td class="mono">${r.endUtc || '—'}</td>
+      <td>${
+        r.status === 'running'
+          ? '<span class="badge stale">⏳ 进行中' +
+            (r.pastReservationEnd ? '（已越过预约终点）' : '') +
+            '</span>'
+          : `<span class="badge ok">${RUN_OUTCOME_LABEL[r.outcome] || r.outcome}</span>`
+      }</td>
+      <td>${
+        r.timedOut === null
+          ? '<span class="muted">—</span>'
+          : r.timedOut
+            ? '<span class="tag-bad">✗ 超时</span>'
+            : '<span class="tag-ok">✓ 未超时</span>'
+      }</td>
+      <td>${
+        r.publicationUsable
+          ? '<span class="tag-ok">✓ 可用</span>'
+          : '<span class="tag-bad">✗ 已失效（历史不改写）</span>'
+      }</td>
+      <td>${
+        r.status === 'running'
+          ? `<button data-run-complete="${r.id}" class="primary">完成</button>
+             <button data-run-abort="${r.id}" class="danger">中止</button>`
+          : ''
+      }</td>
+    </tr>`,
+      )
+      .join('')}</tbody></table></div>`;
+  box.querySelectorAll('[data-run]').forEach((b) =>
+    b.addEventListener('click', () => openRun(Number(b.dataset.run))),
+  );
+  box.querySelectorAll('[data-run-complete]').forEach((b) =>
+    b.addEventListener('click', () => finishRun(Number(b.dataset.runComplete), 'completed')),
+  );
+  box.querySelectorAll('[data-run-abort]').forEach((b) =>
+    b.addEventListener('click', () => finishRun(Number(b.dataset.runAbort), 'aborted')),
+  );
+}
+
+$('#run-start').addEventListener('click', async () => {
+  const runNo = $('#run-no').value.trim();
+  const deviceId = $('#run-device').value.trim();
+  const verificationId = Number($('#run-ver').value);
+  const reservationId = Number($('#run-res').value);
+  $('#run-conflict').innerHTML = '';
+  try {
+    const r = await api('POST', '/api/runs', {
+      runNo,
+      deviceId,
+      verificationId,
+      reservationId,
+    });
+    $('#run-no').value = '';
+    await refresh(
+      r.status === 'finished'
+        ? `运行编号「${r.runNo}」已存在，返回原记录（幂等）。`
+        : `离心运行「${r.runNo}」已开始（开始时间由服务端记录：${r.startUtc}）。`,
+    );
+    await openRun(r.id);
+  } catch (e) {
+    // 冲突（时段/预约已用/设备占用/编号异内容）：列出全部冲突定位
+    if (e.status === 409) {
+      const conflicts = e.data && e.data.detail && e.data.detail.conflicts;
+      $('#run-conflict').innerHTML = `<div class="banner bad">
+        <b>${escapeHtml(e.data.errors && e.data.errors[0] ? e.data.errors[0] : '开始被拒绝')}</b>
+        ${conflicts ? `<ul>${conflicts.map((c) => `<li><code>${escapeHtml(c.type)}</code></li>`).join('')}</ul>` : ''}
+      </div>`;
+    }
+    showAlert(e.message, 'err');
+  }
+});
+
+async function finishRun(id, outcome) {
+  try {
+    const r = await api('POST', `/api/runs/${id}/complete`, { outcome });
+    await refresh();
+    await openRun(r.id);
+    showAlert(
+      r.timedOut
+        ? `运行已完结（${RUN_OUTCOME_LABEL[r.outcome]}）：已越过预约终点，标记超时；设备已释放。`
+        : `运行已完结（${RUN_OUTCOME_LABEL[r.outcome]}）：设备已释放。`,
+      'ok',
+    );
+  } catch (e) {
+    showAlert(e.message, 'err');
+  }
+}
+
+async function openRun(id) {
+  const r = await api('GET', `/api/runs/${id}`);
+  $('#run-title').textContent = `离心运行 ${r.runNo}（#${r.id}）`;
+  const b = r.frozenBasis;
+  const res = b.reservation;
+  const ver = b.verification;
+  const pub = b.publication;
+  const stateBadge =
+    r.status === 'running'
+      ? `<span class="badge stale">⏳ 进行中${r.pastReservationEnd ? '（已越过预约终点）' : ''}</span>`
+      : `<span class="badge ok">已完结 · ${RUN_OUTCOME_LABEL[r.outcome] || r.outcome}</span>`;
+  const timeoutBadge =
+    r.timedOut === null
+      ? ''
+      : r.timedOut
+        ? '<span class="badge bad">✗ 超时（越过预约终点）</span>'
+        : '<span class="badge ok">✓ 未超时</span>';
+  $('#run-detail').innerHTML = `
+    <div class="actions" style="margin-top:0">
+      ${stateBadge} ${timeoutBadge}
+      ${
+        r.publicationUsable
+          ? '<span class="badge ok">✓ 依据图当前可用</span>'
+          : '<span class="badge stale">✗ 依据图当前已失效（冻结历史不变）</span>'
+      }
+    </div>
+    <div class="metrics">
+      <div>设备：<b>${escapeHtml(r.deviceId)}</b></div>
+      <div>开始（服务端）：<b>${r.startUtc}</b></div>
+      <div>结束（服务端）：<b>${r.endUtc || '—'}</b></div>
+    </div>
+    <h3>冻结依据（开始时快照，之后不再变化）</h3>
+    <div class="spec-block">
+      <div class="spec-head"><b>预约 #${res.id}</b>
+        <span class="muted">批次号 ${escapeHtml(res.batchNo)} · 开始时状态 ${res.statusAtStart}</span>
+      </div>
+      <p class="muted mono">时段（左闭右开）：${res.startUtc} 至 ${res.endUtc}</p>
+      <p class="muted">冻结占用：${escapeHtml(usageText(res.usage))}</p>
+    </div>
+    <div class="spec-block">
+      <div class="spec-head"><b>核验 #${ver.id}</b>
+        <span class="muted">完成于 ${ver.completedAt || '—'} · 实测对径差和 ${fmt(ver.diffSum)} g</span>
+      </div>
+      <p class="muted" style="font-family:ui-monospace,monospace;font-size:12px">
+        依据发布 sha256:${ver.basisHash}</p>
+      <table class="pair-list">
+        <thead><tr><th>孔位</th><th>应放</th><th>实测物件</th><th>实测质量</th><th>物件</th><th>承重</th></tr></thead>
+        <tbody>${(ver.checks ? ver.checks.holes : [])
+          .map(
+            (h) => `<tr${h.objectMatch && h.withinCapacity ? '' : ' class="row-bad"'}>
+            <td>孔 ${h.hole}</td><td>${escapeHtml(h.expectedRef || '空')}</td>
+            <td>${escapeHtml(h.actualRef || '空')}</td><td>${fmt(h.measuredMass)} g</td>
+            <td class="${h.objectMatch ? 'tag-ok' : 'tag-bad'}">${h.objectMatch ? '✓' : '✗'}</td>
+            <td class="${h.withinCapacity ? 'tag-ok' : 'tag-bad'}">${h.withinCapacity ? '✓' : '✗'}</td>
+          </tr>`,
+          )
+          .join('')}</tbody></table>
+    </div>
+    <details class="snapshot-block" open>
+      <summary>冻结发布图 #${pub.id}（依据快照，sha256:${pub.basisHash.slice(0, 24)}…）</summary>
+      ${arrangementHtml(pub.result)}
+    </details>
+    ${
+      r.status === 'running'
+        ? `<div class="actions">
+            <button id="run-dlg-complete" class="primary">完成运行</button>
+            <button id="run-dlg-abort" class="danger">中止运行</button>
+          </div>
+          <p class="muted">结束时间由服务端记录；超过预约终点仍可如实完结并标记超时，完结后设备随即释放。</p>`
+        : ''
+    }`;
+  $('#run-dialog').showModal();
+  const c = $('#run-dlg-complete');
+  if (c) c.addEventListener('click', () => { $('#run-dialog').close(); finishRun(id, 'completed'); });
+  const a = $('#run-dlg-abort');
+  if (a) a.addEventListener('click', () => { $('#run-dialog').close(); finishRun(id, 'aborted'); });
+}
+$('#run-dialog-close').addEventListener('click', () => $('#run-dialog').close());
 
 // ---------- 启动 ----------
 

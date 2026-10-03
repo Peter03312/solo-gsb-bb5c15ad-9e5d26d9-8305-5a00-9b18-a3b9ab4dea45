@@ -132,6 +132,37 @@ CREATE TABLE IF NOT EXISTS verifications (
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (publication_id) REFERENCES publications(id)
 );
+
+-- 离心运行：run_no 为幂等键（同编号同开始内容返回原记录、异内容拒绝）。
+-- 开始/结束时间均由服务端记录（毫秒精度 UTC）；开始时冻结发布图、核验结论与
+-- 预约时段三份快照，此后配置/库存/预约状态变化均不改写运行历史。
+-- reservation_id 普通 UNIQUE：一个预约终生至多关联一次运行（含已完结运行）。
+-- 设备占用由部分唯一索引 runs_device_open 兜底：仅进行中（end_utc IS NULL）运行
+-- 占用设备，完结置 end_utc 后行自动移出索引，设备随即释放。
+CREATE TABLE IF NOT EXISTS runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_no TEXT NOT NULL UNIQUE,
+  device_id TEXT NOT NULL,
+  verification_id INTEGER NOT NULL,
+  publication_id INTEGER NOT NULL,
+  reservation_id INTEGER NOT NULL UNIQUE,
+  start_utc TEXT NOT NULL,
+  end_utc TEXT,
+  outcome TEXT CHECK (outcome IN ('completed', 'aborted')),
+  timed_out INTEGER,
+  publication_snapshot_json TEXT NOT NULL,
+  verification_snapshot_json TEXT NOT NULL,
+  reservation_snapshot_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  completed_at TEXT,
+  FOREIGN KEY (verification_id) REFERENCES verifications(id),
+  FOREIGN KEY (publication_id) REFERENCES publications(id),
+  FOREIGN KEY (reservation_id) REFERENCES reservations(id)
+);
+
+-- 同设备至多一条进行中运行；完结（end_utc 置位）后唯一约束自动放行新运行。
+CREATE UNIQUE INDEX IF NOT EXISTS runs_device_open
+  ON runs(device_id) WHERE end_utc IS NULL;
 `;
 
 // ---------- 读取 ----------
@@ -449,4 +480,78 @@ export function listVerificationRows(db) {
         ORDER BY v.id DESC`,
     )
     .all();
+}
+
+// ---------- 离心运行（由 server 在单事务内调用） ----------
+
+export function getRunRow(db, id) {
+  return db.prepare('SELECT * FROM runs WHERE id = ?').get(id);
+}
+
+export function getRunRowByRunNo(db, runNo) {
+  return db.prepare('SELECT * FROM runs WHERE run_no = ?').get(runNo);
+}
+
+export function getRunRowByReservation(db, reservationId) {
+  return db.prepare('SELECT * FROM runs WHERE reservation_id = ?').get(reservationId);
+}
+
+// 同设备进行中的运行（部分唯一索引 runs_device_open 的事务内复核兜底）
+export function getOpenRunByDevice(db, deviceId) {
+  return db
+    .prepare('SELECT * FROM runs WHERE device_id = ? AND end_utc IS NULL')
+    .get(deviceId);
+}
+
+export function listRunRows(db) {
+  return db.prepare('SELECT * FROM runs ORDER BY id DESC').all();
+}
+
+export function insertRun(
+  db,
+  {
+    runNo,
+    deviceId,
+    verificationId,
+    publicationId,
+    reservationId,
+    startUtc,
+    publicationSnapshot,
+    verificationSnapshot,
+    reservationSnapshot,
+  },
+) {
+  const info = db
+    .prepare(
+      `INSERT INTO runs
+         (run_no, device_id, verification_id, publication_id, reservation_id,
+          start_utc, publication_snapshot_json, verification_snapshot_json,
+          reservation_snapshot_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      runNo,
+      deviceId,
+      verificationId,
+      publicationId,
+      reservationId,
+      startUtc,
+      JSON.stringify(publicationSnapshot),
+      JSON.stringify(verificationSnapshot),
+      JSON.stringify(reservationSnapshot),
+    );
+  return getRunRow(db, info.lastInsertRowid);
+}
+
+// 完结：仅进行中（end_utc IS NULL）的运行可完结（条件更新，未命中返回 null）。
+// 置 end_utc 后行自动移出 runs_device_open，设备随即释放；预约表不做任何改写。
+export function completeRun(db, id, { outcome, endUtc, timedOut }) {
+  const info = db
+    .prepare(
+      `UPDATE runs
+          SET end_utc = ?, outcome = ?, timed_out = ?, completed_at = ?
+        WHERE id = ? AND end_utc IS NULL`,
+    )
+    .run(endUtc, outcome, timedOut ? 1 : 0, endUtc, id);
+  return info.changes === 1 ? getRunRow(db, id) : null;
 }

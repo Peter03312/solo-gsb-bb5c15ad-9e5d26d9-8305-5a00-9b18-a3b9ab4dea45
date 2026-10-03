@@ -33,6 +33,13 @@ import {
   listActiveSuspensions,
   insertSuspension,
   revokeSuspension,
+  listRunRows,
+  getRunRow,
+  getRunRowByRunNo,
+  getRunRowByReservation,
+  getOpenRunByDevice,
+  insertRun,
+  completeRun,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -45,6 +52,15 @@ import {
   buildSchedule,
 } from './reserve.js';
 import {
+  normalizeRunStart,
+  normalizeOutcome,
+  evaluateRunStart,
+  isTimedOut,
+  buildPublicationSnapshot,
+  buildVerificationSnapshot,
+  buildReservationSnapshot,
+} from './runs.js';
+import {
   ValidationError,
   ConflictError,
   validateConfig,
@@ -56,7 +72,9 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export function createApp(db) {
+export function createApp(db, options = {}) {
+  // 可注入时钟（仅测试用）：默认取服务端真实时间。运行开始/结束均以此为准。
+  const clock = typeof options.now === 'function' ? options.now : () => Date.now();
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
@@ -87,6 +105,7 @@ export function createApp(db) {
         reservationView(r, hash, Date.now()),
       ),
       suspensions: listSuspensionRows(db).map((r) => suspensionView(r, Date.now())),
+      runs: listRunRows(db).map((r) => runView(r, hash, clock())),
     });
   });
 
@@ -1001,6 +1020,225 @@ export function createApp(db) {
     }
   });
 
+  // ---------- 离心运行 ----------
+  //
+  // 实验人员以「唯一运行编号 + 非空设备编号 + 已完成核验编号 + 预约编号」开始一次
+  // 离心运行；开始/结束时间一律由服务端记录。开始事务内确认：核验已通过、核验与
+  // 生效预约指向同一发布图、发布图当前可用、当前时刻处于预约左闭右开时段、该预约
+  // 未用于其他运行、同设备无进行中运行；失败指出冲突且不留记录。
+  // 开始即冻结发布图、核验结论与预约时段；完结填写 completed/aborted，结束时间须
+  // 晚于开始，越过预约终点仍如实完结并标记超时，随即释放设备、不改写预约。
+  // 运行编号为开始幂等键：同编号同内容返回原记录、异内容拒绝；完结同状态返回原
+  // 结果、异状态拒绝。后续配置/库存/预约状态变化不改写历史。
+
+  function runView(row, hash, nowMs) {
+    const completed = !!row.end_utc;
+    const pubSnap = JSON.parse(row.publication_snapshot_json);
+    const view = {
+      id: row.id,
+      runNo: row.run_no,
+      deviceId: row.device_id,
+      verificationId: row.verification_id,
+      publicationId: row.publication_id,
+      reservationId: row.reservation_id,
+      startUtc: row.start_utc,
+      endUtc: row.end_utc,
+      outcome: row.outcome,
+      timedOut: row.timed_out == null ? null : !!row.timed_out,
+      status: completed ? 'finished' : 'running',
+      createdAt: row.created_at,
+      completedAt: row.completed_at,
+      // 依据图当前是否仍可用于装载（仅展示用；冻结快照不随之改写）
+      publicationUsable:
+        hash !== null && !!pubSnap.feasible && pubSnap.basisHash === hash,
+    };
+    if (!completed) {
+      // 进行中：实时提示当前是否已越过预约终点（完结时 timedOut 才是冻结结论）
+      const resSnap = JSON.parse(row.reservation_snapshot_json);
+      view.pastReservationEnd = nowMs >= Date.parse(resSnap.endUtc);
+    } else {
+      view.pastReservationEnd = null;
+    }
+    return view;
+  }
+
+  function runDetail(row, hash, nowMs) {
+    return {
+      ...runView(row, hash, nowMs),
+      frozenBasis: {
+        publication: JSON.parse(row.publication_snapshot_json),
+        verification: JSON.parse(row.verification_snapshot_json),
+        reservation: JSON.parse(row.reservation_snapshot_json),
+      },
+    };
+  }
+
+  function conflictMessages(conflicts) {
+    return conflicts.map((c) => {
+      if (c.type === 'outsideWindow') {
+        return `当前服务端时刻 ${c.now} 不在预约 #${c.reservationId} 时段（左闭右开 ${c.start} 至 ${c.end}）内，不能开始运行`;
+      }
+      if (c.type === 'reservationUsed') {
+        return `该预约已用于运行 #${c.runId}（运行编号「${c.runNo}」，${c.open ? '进行中' : '已完结'}）：一个预约只能用于一次运行`;
+      }
+      if (c.type === 'deviceBusy') {
+        return `设备「${c.deviceId}」有进行中运行 #${c.runId}（运行编号「${c.runNo}」），请先完结该运行`;
+      }
+      return String(c.type);
+    });
+  }
+
+  // 开始运行：201 新建 / 200 幂等重放 / 400 依据不成立 / 409 状态冲突
+  app.post('/api/runs', (req, res, next) => {
+    try {
+      const { errors, value } = normalizeRunStart(req.body);
+      if (errors.length) throw new ValidationError(errors);
+      const { runNo, deviceId, verificationId, reservationId } = value;
+
+      let status = 201;
+      let detail;
+      const tx = db.transaction(() => {
+        // 幂等：相同运行编号 + 相同开始内容返回原记录；异内容拒绝（优先于一切检查）
+        const existing = getRunRowByRunNo(db, runNo);
+        if (existing) {
+          const same =
+            existing.device_id === deviceId &&
+            existing.verification_id === verificationId &&
+            existing.reservation_id === reservationId;
+          if (!same) {
+            throw new ConflictError(
+              [
+                `运行编号「${runNo}」已存在（运行 #${existing.id}）且开始内容不同，拒绝重复提交`,
+              ],
+              { existingId: existing.id },
+            );
+          }
+          detail = runDetail(existing, currentHash(db), clock());
+          status = 200;
+          return;
+        }
+
+        // 事务内重读全部依据（不信任客户端、不信任事务外状态）
+        const nowMs = clock();
+        const verification = getVerificationRow(db, verificationId);
+        const reservation = getReservationRow(db, reservationId);
+        const publication = verification
+          ? getPublication(db, verification.publication_id)
+          : null;
+        const verdict = evaluateRunStart({
+          verification,
+          reservation,
+          publication,
+          currentHash: currentHash(db),
+          nowMs,
+          runByReservation: getRunRowByReservation(db, reservationId),
+          openRunByDevice: getOpenRunByDevice(db, deviceId),
+          deviceId,
+        });
+        if (verdict.precondition.length) {
+          throw new ValidationError(verdict.precondition);
+        }
+        if (verdict.conflicts.length) {
+          throw new ConflictError(
+            ['无法开始离心运行（存在冲突），未产生任何记录：', ...conflictMessages(verdict.conflicts)],
+            { detail: { conflicts: verdict.conflicts } },
+          );
+        }
+
+        // 冻结发布图、核验结论与预约时段
+        const row = insertRun(db, {
+          runNo,
+          deviceId,
+          verificationId,
+          publicationId: verification.publication_id,
+          reservationId,
+          startUtc: toIso(nowMs),
+          publicationSnapshot: buildPublicationSnapshot(publication),
+          verificationSnapshot: buildVerificationSnapshot(verification, publication),
+          reservationSnapshot: buildReservationSnapshot(reservation),
+        });
+        detail = runDetail(row, currentHash(db), nowMs);
+      });
+      tx();
+      res.status(status).json(detail);
+    } catch (e) {
+      // 并发兜底：唯一索引（预约已用 / 设备进行中）在竞态下命中 → 409，不留记录
+      if (e && (e.code === 'SQLITE_CONSTRAINT_UNIQUE' || e.code === 'SQLITE_CONSTRAINT_TRIGGER')) {
+        return next(new ConflictError(['并发冲突：预约已被其他运行使用或设备刚被占用，请刷新后重试']));
+      }
+      next(e);
+    }
+  });
+
+  app.get('/api/runs', (req, res) => {
+    const hash = currentHash(db);
+    res.json(listRunRows(db).map((r) => runView(r, hash, clock())));
+  });
+
+  app.get('/api/runs/:id', (req, res) => {
+    const row = getRunRow(db, Number(req.params.id));
+    if (!row) return res.status(404).json({ error: '运行记录不存在' });
+    res.json(runDetail(row, currentHash(db), clock()));
+  });
+
+  // 完结运行：服务端记录结束时间；同状态重复提交返回原结果，异状态拒绝。
+  // 越过预约终点如实完结并标记 timedOut；置 end_utc 后设备唯一索引自动放行（释放）。
+  app.post('/api/runs/:id/complete', (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const existed = getRunRow(db, id);
+      if (!existed) return res.status(404).json({ error: '运行记录不存在' });
+      const { errors, outcome } = normalizeOutcome(req.body);
+      if (errors.length) throw new ValidationError(errors);
+
+      let status = 200;
+      let detail;
+      const tx = db.transaction(() => {
+        const row = getRunRow(db, id);
+        // 完结幂等：同状态返回原结果，异状态拒绝
+        if (row.end_utc) {
+          if (row.outcome !== outcome) {
+            throw new ConflictError(
+              [
+                `运行 #${id} 已完结为「${row.outcome === 'completed' ? '完成' : '中止'}」，` +
+                  `不能改记为「${outcome === 'completed' ? '完成' : '中止'}」（历史不改写）`,
+              ],
+              { existingOutcome: row.outcome, timedOut: !!row.timed_out },
+            );
+          }
+          detail = runDetail(row, currentHash(db), clock());
+          status = 200;
+          return;
+        }
+
+        // 结束时间由服务端记录，须晚于开始
+        const nowMs = clock();
+        const startMs = Date.parse(row.start_utc);
+        if (!(nowMs > startMs)) {
+          throw new ValidationError([
+            '服务端记录的结束时间不晚于开始时间，不能完结（时钟异常，请稍后重试）',
+          ]);
+        }
+        const resSnap = JSON.parse(row.reservation_snapshot_json);
+        const timedOut = isTimedOut(nowMs, Date.parse(resSnap.endUtc));
+        const updated = completeRun(db, id, {
+          outcome,
+          endUtc: toIso(nowMs),
+          timedOut,
+        });
+        if (!updated) {
+          throw new ConflictError([`运行 #${id} 状态已变化（可能已被他人完结），请刷新后重试`]);
+        }
+        detail = runDetail(updated, currentHash(db), nowMs);
+        status = 201;
+      });
+      tx();
+      res.status(status).json(detail);
+    } catch (e) {
+      next(e);
+    }
+  });
+
   // ---------- 静态前端 ----------
 
   app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -1020,6 +1258,8 @@ export function createApp(db) {
         ...(err.existingId != null ? { existingId: err.existingId } : {}),
         ...(err.completed != null ? { completed: err.completed } : {}),
         ...(err.currentVersion != null ? { currentVersion: err.currentVersion } : {}),
+        ...(err.existingOutcome != null ? { existingOutcome: err.existingOutcome } : {}),
+        ...(err.timedOut != null ? { timedOut: err.timedOut } : {}),
         ...(err.detail ? { detail: err.detail } : {}),
       });
     }

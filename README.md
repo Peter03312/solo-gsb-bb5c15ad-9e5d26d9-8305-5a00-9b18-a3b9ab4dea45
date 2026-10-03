@@ -48,6 +48,16 @@
 **新预约**的可用量（既有预约不改写，停用允许与既有预约重叠）；**仅未开始的停用可撤销**，
 撤销保留历史并立即释放后续容量。
 
+实验人员以**唯一运行编号、非空设备编号、已完成核验编号和预约编号**开始一次**离心运行**，
+开始与结束时间均由**服务端记录**。开始时在**单个事务内**确认：核验已通过、核验与生效预约
+指向**同一条发布图**、发布图**当前可用**、当前时刻处于预约**左闭右开**时段、该预约未用于
+其他运行、同设备无进行中运行；任一不满足即指出冲突且**不留记录**。开始后**冻结**发布图、
+核验结论与预约时段；完结时填写**完成**或**中止**，结束时间须晚于开始，超过预约终点仍如实
+完结并标记**超时**（左闭右开：结束时刻等于预约终点即超时），随即**释放设备**、不改写预约。
+运行编号为幂等键：同编号同开始内容重复提交返回原记录、异内容拒绝；完结同状态重复提交返回
+原结果、异状态拒绝。此后配置、库存或预约状态的任何变化都**不改写运行历史**（页面可查看运行
+状态、超时标记与冻结依据）。
+
 ## 约束模型
 
 - 孔位编号 `0 … N-1`，孔位数 N 为 4–12 的偶数；孔 `i` 与孔 `i + N/2` 对径，孔 `i` 与孔 `(i+1)%N` 环形相邻。
@@ -178,12 +188,29 @@ npm test
       「占用 + 停用」合计不足区段（仅「占用超库存」的旧字段含义保持不变）。
    5. 仅**未开始**的停用可「撤销停用」；撤销后历史保留（状态 `revoked`），
       后续容量立即释放；已撤销重复调用幂等返回原记录，已开始/已结束的停用返回 409。
+12. **离心运行**（第 11 节）：
+    1. 在第 11 节填写**唯一运行编号**、**非空设备编号**，选择一条**已完成核验**与一条
+       **预约**（两者必须指向同一条当前可用的发布图），点「开始离心运行」。
+    2. 服务端在事务内复核六项条件（核验通过 / 同图 / 图当前可用 / 当前时刻在预约
+       左闭右开时段 / 预约未用过 / 同设备无进行中运行），并由**服务端记录开始时间**；
+       不满足时 400 指出依据问题或 409 列出全部冲突（`detail.conflicts`：
+       `outsideWindow` / `reservationUsed` / `deviceBusy`），**不产生任何记录**。
+    3. 开始成功即冻结发布图、核验结论与预约时段三份快照；列表中可查看状态
+       （`running` / `finished`）、结果、**超时标记**与依据图当前可用性，点开可查看
+       完整冻结依据（预约时段、核验逐孔判定、发布装载图快照）。
+    4. 运行结束后点「完成」（`completed`）或「中止」（`aborted`）；结束时间由服务端记录，
+       越过预约终点也如实完结并标记**超时**，随即**释放设备**（同设备可开始下一次运行），
+       **预约不被改写**。
+    5. 幂等：相同运行编号 + 相同开始内容重复提交返回原记录（200），同编号异内容 409；
+       完结同状态重复提交返回原结果（200，不刷新结束时间），异状态 409。
+    6. 后续配置、库存或预约状态变化只改变页面上「依据图当前可用」标记，
+       **运行记录与冻结依据永不改写**。
 
 ## REST API 摘要
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/state` | 当前录入数据（含避邻对与固定孔位）、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表 |
+| GET | `/api/state` | 当前录入数据（含避邻对与固定孔位）、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表、离心运行列表 |
 | PUT | `/api/config` | 整体替换转子配置（孔位数、容差、各孔最大承重），事务；缩小孔数使现有固定孔位越界时整次拒绝 |
 | PUT | `/api/tubes` | 整体替换全部离心管，事务，校验失败回滚；替换后若留下失效避邻对（对中管不再存在）或失效固定孔位（管不存在或孔位不再可用）拒绝并保留原数据 |
 | PUT | `/api/weights` | 整体替换全部配重规格，事务，校验失败回滚 |
@@ -209,6 +236,10 @@ npm test
 | GET | `/api/suspensions/:id` | 单条停用详情 |
 | POST | `/api/suspensions/:id/revoke` | 撤销停用（仅未开始）；已撤销幂等返回原记录；已开始/已结束 409；撤销后立即释放后续容量 |
 | GET | `/api/schedule?from=&to=` | 日程：各质量规格在时段内的预约占用分段（`segments`，占用超库存 `shortage`）、停用分段（`suspendedSegments`）与「占用+停用」合计分段（`combinedSegments`，合计超库存 `shortage` / 规格级 `combinedShortage`）；from/to 缺省为覆盖全部生效中预约与停用 |
+| POST | `/api/runs` | 开始离心运行（唯一 `runNo` + 非空 `deviceId` + 已完成 `verificationId` + `reservationId`）；开始/结束时间服务端记录；单事务内确认核验通过、核验与预约同图、图当前可用、当前时刻在预约左闭右开时段、预约未用过、同设备无进行中运行；201 新建、200 同编号同内容幂等重放、400 依据不成立、409 时段外/预约已用/设备占用/同编号异内容（附 `detail.conflicts` 与 `existingId`），失败不留记录 |
+| GET | `/api/runs` | 运行列表（状态 `running/finished`、`outcome`、`timedOut`、依据图当前可用性；进行中附 `pastReservationEnd`） |
+| GET | `/api/runs/:id` | 单条运行详情（含 `frozenBasis`：冻结的发布图、核验结论与预约时段三份快照） |
+| POST | `/api/runs/:id/complete` | 完结运行（`{"outcome":"completed"}` 或 `"aborted"`）；结束时间由服务端记录且须晚于开始，越过预约终点如实完结并置 `timedOut`，随即释放设备、不改写预约；201 首次完结、200 同状态幂等返回原结果、409 异状态（附 `existingOutcome`） |
 
 错误统一返回 `400 {"error","errors":[...]}`；状态冲突（草稿已存在、版本过期、核验已冻结、
 预约批次号冲突、配重数量不足等）返回 `409` 并附带 `existingId` / `currentVersion` 等字段。
@@ -216,7 +247,11 @@ npm test
 逐对（`withinTolerance`）判定，可直接用于前端高亮定位；预约数量不足（含停用占用）时 409
 响应的 `detail.conflicts` 内带冲突规格、当前库存与超限时段（`windows`，含 `used` 预约占用
 与 `suspended` 停用量）；停用登记超量时 409 响应结构相同（`windows[].suspended` 为已停用
-数量），均可直接用于日程定位。
+数量），均可直接用于日程定位。离心运行开始被拒时，400 响应逐条说明依据问题（核验未完成、
+核验与预约不同图、图当前不可用、预约不存在或已取消）；409 响应的 `detail.conflicts`
+为冲突数组（`outsideWindow` 附当前时刻与预约时段、`reservationUsed` 附已占用该预约的运行
+编号、`deviceBusy` 附同设备进行中运行编号），同运行编号异内容时附 `existingId`；
+完结异状态时 409 附 `existingOutcome` 与冻结的 `timedOut`。
 
 ## 避邻对 HTTP API 调用示例
 
@@ -476,19 +511,101 @@ curl -s $BASE/api/suspensions
 curl -s $BASE/api/suspensions/1
 ```
 
+# 6) 停用列表 / 单条（列表含已撤销历史）
+curl -s $BASE/api/suspensions
+curl -s $BASE/api/suspensions/1
+```
+
+## 离心运行 HTTP API 调用示例
+
+```bash
+BASE=http://localhost:8080
+
+# 前置：发布图 #1 当前可用、核验 #1 已完成（指向发布图 #1）、预约 #3 生效（也指向 #1）。
+# 预约时段示例（UTC，左闭右开）：2026-10-03T08:00Z 至 2026-10-03T12:00Z。
+# 下例假定当前服务端时刻处于该时段内。
+
+# 1) 开始运行：唯一运行编号 + 非空设备编号 + 已完成核验编号 + 预约编号
+#    开始时间由服务端记录；事务内复核六项条件，通过后冻结三份依据快照 → 201
+curl -s -X POST $BASE/api/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"runNo":"RUN-2026-001","deviceId":"CENT-A",
+       "verificationId":1,"reservationId":3}'
+# -> {"id":1,"runNo":"RUN-2026-001","deviceId":"CENT-A",
+#     "verificationId":1,"publicationId":1,"reservationId":3,
+#     "startUtc":"2026-10-03T09:12:31.482Z","endUtc":null,
+#     "outcome":null,"timedOut":null,"status":"running",
+#     "publicationUsable":true,"pastReservationEnd":false,
+#     "frozenBasis":{"publication":{...冻结发布图...},
+#                    "verification":{...冻结核验结论（逐孔/逐对判定）...},
+#                    "reservation":{"id":3,"batchNo":"...","startUtc":"...","endUtc":"...",
+#                                   "usage":[{"mass":50,"count":1}],...}}}
+
+# 2) 幂等：相同运行编号 + 相同开始内容重复提交 → 200 返回原记录（不新建、不改开始时间）
+curl -s -X POST $BASE/api/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"runNo":"RUN-2026-001","deviceId":"CENT-A",
+       "verificationId":1,"reservationId":3}'
+
+# 3) 同编号异内容 → 409（附 existingId）
+curl -s -X POST $BASE/api/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"runNo":"RUN-2026-001","deviceId":"CENT-B",
+       "verificationId":1,"reservationId":3}'
+# -> 409 {"errors":["运行编号「RUN-2026-001」已存在（运行 #1）且开始内容不同，拒绝重复提交"],
+#         "existingId":1}
+
+# 4) 依据不成立 → 400：核验未完成 / 核验与预约不同图 / 图当前不可用 / 预约已取消 等
+curl -s -X POST $BASE/api/runs -H 'Content-Type: application/json' \
+  -d '{"runNo":"RUN-X","deviceId":"CENT-A","verificationId":9,"reservationId":3}'
+# -> 400 {"errors":["核验记录不存在：请先用已通过的现场装载核验编号发起运行"]}
+
+# 5) 状态冲突 → 409：时段外 / 预约已用于其他运行 / 同设备进行中（可一次列出多个冲突）
+curl -s -X POST $BASE/api/runs -H 'Content-Type: application/json' \
+  -d '{"runNo":"RUN-Y","deviceId":"CENT-A","verificationId":1,"reservationId":3}'
+# -> 409 {"errors":["无法开始离心运行（存在冲突），未产生任何记录：",
+#                   "该预约已用于运行 #1（运行编号「RUN-2026-001」，进行中）：一个预约只能用于一次运行",
+#                   "设备「CENT-A」有进行中运行 #1（运行编号「RUN-2026-001」），请先完结该运行"],
+#         "detail":{"conflicts":[{"type":"reservationUsed","runId":1,"runNo":"RUN-2026-001","open":true},
+#                                {"type":"deviceBusy","deviceId":"CENT-A","runId":1,"runNo":"RUN-2026-001"}]}}
+
+# 6) 完结：完成 / 中止；结束时间由服务端记录；越过预约终点如实完结并 timedOut=true，
+#    随即释放设备、不改写预约 → 201
+curl -s -X POST $BASE/api/runs/1/complete \
+  -H 'Content-Type: application/json' -d '{"outcome":"completed"}'
+# -> {"id":1,"status":"finished","outcome":"completed",
+#     "startUtc":"2026-10-03T09:12:31.482Z","endUtc":"2026-10-03T12:30:02.001Z",
+#     "timedOut":true, ...}
+
+# 7) 完结幂等：同状态 → 200 返回原结果（结束时间不刷新）；异状态 → 409（附 existingOutcome）
+curl -s -X POST $BASE/api/runs/1/complete \
+  -H 'Content-Type: application/json' -d '{"outcome":"completed"}'
+curl -s -X POST $BASE/api/runs/1/complete \
+  -H 'Content-Type: application/json' -d '{"outcome":"aborted"}'
+# -> 409 {"errors":["运行 #1 已完结为「完成」，不能改记为「中止」（历史不改写）"],
+#         "existingOutcome":"completed","timedOut":true}
+
+# 8) 列表 / 详情（详情含冻结依据：预约时段、核验逐孔判定、发布装载图快照）
+curl -s $BASE/api/runs
+curl -s $BASE/api/runs/1
+# GET /api/state 的响应中也带 runs（页面第 11 节直接使用）
+```
+
 ## 目录结构
 
 ```
 src/
-  server.js     Express 服务与路由、原子发布/核验/预约/停用事务
-  db.js         SQLite 连接、建表（含固定孔位表）、数据访问
+  server.js     Express 服务与路由、原子发布/核验/预约/停用/运行事务
+  db.js         SQLite 连接、建表（含固定孔位表与运行表/设备部分唯一索引）、数据访问
   solver.js     求解器（含避邻对与固定孔位约束）、独立复核、数据指纹（纯函数，含测试）
   verify.js     现场核验：录入规整、进度、完成判定（纯函数，含测试）
   reserve.js    时段预约与临时停用：UTC 解析、冻结图占用、双层扫描线（占用+停用）
                 容量判定与日程（纯函数，含测试）
+  runs.js       离心运行：开始请求规整、事务前六项条件/冲突判定、超时判定、
+                发布图/核验/预约三份冻结快照构造（纯函数，含测试）
   validate.js   输入校验（非法质量/重复编号/越界/避邻对/固定孔位）、400/409 错误类型
 public/         浏览器界面（原生 HTML/CSS/JS，无需构建）
 test/           node --test 测试（求解器 + 避邻对 + 固定孔位 + HTTP API + 核验
-                + 时段预约 + 临时停用，共 113 项）
+                + 时段预约 + 临时停用 + 离心运行，共 132 项）
 Dockerfile / docker-compose.yml
 ```
