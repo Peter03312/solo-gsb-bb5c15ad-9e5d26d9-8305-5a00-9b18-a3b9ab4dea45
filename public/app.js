@@ -92,6 +92,7 @@ function renderAll() {
   renderVerifications();
   renderReservations();
   renderSuspensions();
+  renderRuns();
 }
 
 function renderHoleMax(d) {
@@ -1137,6 +1138,227 @@ async function revokeSuspension(id) {
     showAlert(e.message, 'err');
   }
 }
+
+// ---------- 离心运行 ----------
+
+const RUN_STATUS_LABEL = {
+  running: '进行中',
+  overrunning: '进行中（已超预约终点）',
+  completed: '已完成',
+  aborted: '已中止',
+};
+
+function renderRuns() {
+  // 核验下拉：仅展示已完成核验（未完成草稿不能开始运行）
+  const verSel = $('#run-ver');
+  const verList = (state.verifications || []).filter((v) => v.completed);
+  const verPrev = verSel.value;
+  verSel.innerHTML = verList.length
+    ? verList
+        .map(
+          (v) =>
+            `<option value="${v.id}">核验 #${v.id}（发布图 #${v.publicationId}，已通过）</option>`,
+        )
+        .join('')
+    : '<option value="">（暂无已完成核验）</option>';
+  if (verList.some((v) => String(v.id) === verPrev)) verSel.value = verPrev;
+
+  // 预约下拉：仅展示生效中预约（已取消不能开始运行）
+  const resSel = $('#run-res');
+  const resList = (state.reservations || []).filter((r) => r.status === 'active');
+  const resPrev = resSel.value;
+  resSel.innerHTML = resList.length
+    ? resList
+        .map(
+          (r) =>
+            `<option value="${r.id}">预约 #${r.id}（批次 ${r.batchNo}，图 #${r.publicationId}，${r.startUtc} 至 ${r.endUtc}）</option>`,
+        )
+        .join('')
+    : '<option value="">（暂无生效中预约）</option>';
+  if (resList.some((r) => String(r.id) === resPrev)) resSel.value = resPrev;
+
+  const box = $('#run-list');
+  const list = state.runs || [];
+  if (list.length === 0) {
+    box.innerHTML = '<div class="muted">暂无运行记录。</div>';
+    return;
+  }
+  box.innerHTML = `<div class="table-wrap"><table class="res-table">
+    <thead><tr>
+      <th>运行编号</th><th>设备</th><th>状态</th><th>超时</th>
+      <th>开始 / 结束（UTC，服务端记录）</th><th>核验 / 预约 / 发布图</th>
+      <th>依据图当前可用</th><th></th>
+    </tr></thead><tbody>${list
+      .map(
+        (r) => `<tr${r.status === 'aborted' ? ' class="row-stale"' : ''}>
+      <td><b>${escapeHtml(r.runNo)}</b></td>
+      <td>${escapeHtml(r.deviceNo)}</td>
+      <td><span class="badge ${
+        r.status === 'running'
+          ? r.phase === 'overrunning'
+            ? 'bad'
+            : 'ok'
+          : r.status === 'completed'
+            ? 'ok'
+            : 'stale'
+      }">${RUN_STATUS_LABEL[r.phase === 'overrunning' ? 'overrunning' : r.status]}</span></td>
+      <td>${
+        r.timedOut
+          ? '<span class="badge bad">⏱ 超时完结</span>'
+          : r.status === 'running'
+            ? '<span class="muted">—</span>'
+            : '<span class="tag-ok">按时</span>'
+      }</td>
+      <td class="mono">${r.startUtc}<br>${r.endedAt ? `至 ${r.endedAt}` : '（进行中）'}</td>
+      <td class="mono">核验 #${r.verificationId}<br>预约 #${r.reservationId}
+        （${r.frozenBasis.reservationCurrentStatus === 'cancelled' ? '后已取消' : '生效中'}）<br>
+        发布图 #${r.publicationId}</td>
+      <td>${
+        r.frozenBasis.publication.currentlyUsable
+          ? '<span class="tag-ok">✓ 可用</span>'
+          : '<span class="tag-bad">✗ 已失效（历史冻结不变）</span>'
+      }</td>
+      <td style="white-space:nowrap">
+        <button data-run-view="${r.id}">查看冻结依据</button>
+        ${
+          r.status === 'running'
+            ? `<button data-run-complete="${r.id}" class="primary">完成</button>
+               <button data-run-abort="${r.id}" class="danger">中止</button>`
+            : ''
+        }
+      </td>
+    </tr>`,
+      )
+      .join('')}</tbody></table></div>`;
+  box.querySelectorAll('[data-run-view]').forEach((b) =>
+    b.addEventListener('click', () => openRun(Number(b.dataset.runView))),
+  );
+  box.querySelectorAll('[data-run-complete]').forEach((b) =>
+    b.addEventListener('click', () => completeRun(Number(b.dataset.runComplete), 'completed')),
+  );
+  box.querySelectorAll('[data-run-abort]').forEach((b) =>
+    b.addEventListener('click', () => completeRun(Number(b.dataset.runAbort), 'aborted')),
+  );
+}
+
+$('#run-start').addEventListener('click', async () => {
+  const body = {
+    runNo: $('#run-no').value.trim(),
+    deviceNo: $('#run-device').value.trim(),
+    verificationId: Number($('#run-ver').value),
+    reservationId: Number($('#run-res').value),
+  };
+  $('#run-conflict').innerHTML = '';
+  try {
+    const r = await api('POST', '/api/runs', body);
+    $('#run-no').value = '';
+    $('#run-device').value = '';
+    await refresh(
+      `运行「${r.runNo}」已提交（#${r.id}，状态：${
+        r.status === 'running' ? '进行中' : r.status === 'completed' ? '已完成' : '已中止'
+      }）：发布图、核验结论与预约时段已冻结。`,
+    );
+  } catch (e) {
+    $('#run-conflict').innerHTML = `<div class="banner bad">
+      <b>运行未能开始（事务已回滚，未留记录）：</b>
+      <ul>${(e.data && e.data.errors ? e.data.errors : [e.message])
+        .map((x) => `<li>${escapeHtml(x)}</li>`)
+        .join('')}</ul>
+    </div>`;
+    showAlert(e.message, 'err');
+  }
+});
+
+async function completeRun(id, outcome) {
+  const label = outcome === 'completed' ? '完成' : '中止';
+  try {
+    const r = await api('POST', `/api/runs/${id}/complete`, { outcome });
+    await refresh(
+      `运行「${r.runNo}」已${label}（#${id}）${
+        r.timedOut ? '，已标记超时（超过预约终点）' : ''
+      }；设备已释放。`,
+    );
+  } catch (e) {
+    showAlert(e.message, 'err');
+  }
+}
+
+async function openRun(id) {
+  const r = await api('GET', `/api/runs/${id}`);
+  $('#run-title').textContent = `离心运行 #${r.id}（${r.runNo}）`;
+  const fb = r.frozenBasis;
+  const resStatus =
+    fb.reservationCurrentStatus === 'cancelled'
+      ? '<span class="badge stale">预约后已取消（运行历史不改写）</span>'
+      : '<span class="badge ok">预约生效中</span>';
+  $('#run-detail').innerHTML = `
+    <div class="actions" style="margin-top:0">
+      <span class="badge ${
+        r.status === 'running' ? 'ok' : r.status === 'completed' ? 'ok' : 'stale'
+      }">${RUN_STATUS_LABEL[r.phase === 'overrunning' ? 'overrunning' : r.status]}</span>
+      ${
+        r.timedOut
+          ? '<span class="badge bad">⏱ 超过预约终点完结（超时）</span>'
+          : r.status === 'running'
+            ? ''
+            : '<span class="badge ok">未超时</span>'
+      }
+      ${fb.publication.currentlyUsable ? '' : '<span class="badge bad">依据发布图当前已失效（冻结内容不变）</span>'}
+    </div>
+    <p class="muted">设备：<b>${escapeHtml(r.deviceNo)}</b></p>
+    <p class="muted mono">开始：${r.startUtc}<br>结束：${r.endedAt || '（进行中，服务端记录结束时间）'}</p>
+    <h3>冻结的发布图依据</h3>
+    <p class="muted mono">发布记录 #${fb.publication.id} · sha256:${fb.publication.basisHash} · 可行：${
+      fb.publication.feasible ? '是' : '否'
+    }</p>
+    ${arrangementHtml(fb.publication.result)}
+    <h3>冻结的核验结论</h3>
+    <p class="muted">核验 #${fb.verification.id}：${
+      fb.verification.passed
+        ? '<span class="tag-ok">✓ 核验通过（开始时已完成并冻结）</span>'
+        : '<span class="tag-bad">✗ 未通过</span>'
+    } · 实测对径差和 ${fmt(fb.verification.diffSum)} g · 实测总质量 ${fmt(
+      fb.verification.massSum,
+    )} g</p>
+    ${
+      fb.verification.checks
+        ? `<table class="pair-list">
+      <thead><tr><th>对径孔对</th><th>A 侧实测</th><th>B 侧实测</th><th>差值</th><th>冻结容差判定</th></tr></thead>
+      <tbody>${fb.verification.checks.pairs
+        .map(
+          (p) => `<tr><td>${p.a} ↔ ${p.b}</td><td>${fmt(p.massA)} g</td>
+          <td>${fmt(p.massB)} g</td><td>${fmt(p.diff)} g</td>
+          <td class="${p.withinTolerance ? 'tag-ok' : 'tag-bad'}">${
+            p.withinTolerance ? '✓ 合格' : '✗ 超限'
+          }</td></tr>`,
+        )
+        .join('')}</tbody></table>`
+        : ''
+    }
+    <h3>冻结的预约时段</h3>
+    <div class="actions" style="margin-top:0">${resStatus}</div>
+    <p class="muted mono">预约 #${fb.reservation.id}：[${fb.reservation.startUtc}, ${
+      fb.reservation.endUtc})（左闭右开）<br>
+      冻结占用规格：${escapeHtml(usageText(fb.reservation.usage))}</p>
+    <details class="snapshot-block">
+      <summary>冻结的发布图配置快照</summary>
+      <pre>${escapeHtml(JSON.stringify(fb.publication.config, null, 2))}</pre>
+    </details>
+    ${
+      r.status === 'running'
+        ? `<div class="actions">
+             <button id="run-detail-complete" class="primary">完结：完成</button>
+             <button id="run-detail-abort" class="danger">完结：中止</button>
+           </div>`
+        : ''
+    }`;
+  const c = $('#run-detail-complete');
+  if (c) c.addEventListener('click', () => { $('#run-dialog').close(); completeRun(id, 'completed'); });
+  const a = $('#run-detail-abort');
+  if (a) a.addEventListener('click', () => { $('#run-dialog').close(); completeRun(id, 'aborted'); });
+  $('#run-dialog').showModal();
+}
+$('#run-detail-close').addEventListener('click', () => $('#run-dialog').close());
 
 // ---------- 启动 ----------
 

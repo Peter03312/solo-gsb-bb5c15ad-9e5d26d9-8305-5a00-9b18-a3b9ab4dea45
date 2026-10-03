@@ -33,6 +33,13 @@ import {
   listActiveSuspensions,
   insertSuspension,
   revokeSuspension,
+  listRunRows,
+  getRunRow,
+  getRunRowByRunNo,
+  getRunRowByReservation,
+  getActiveRunRowByDevice,
+  insertRun,
+  completeRun,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -44,6 +51,12 @@ import {
   checkSuspension,
   buildSchedule,
 } from './reserve.js';
+import {
+  normalizeStartInput,
+  normalizeCompleteInput,
+  isWithinReservation,
+  isOverrun,
+} from './run.js';
 import {
   ValidationError,
   ConflictError,
@@ -87,6 +100,7 @@ export function createApp(db) {
         reservationView(r, hash, Date.now()),
       ),
       suspensions: listSuspensionRows(db).map((r) => suspensionView(r, Date.now())),
+      runs: listRunRows(db).map((r) => runView(r, hash, Date.now())),
     });
   });
 
@@ -1001,6 +1015,299 @@ export function createApp(db) {
     }
   });
 
+  // ---------- 离心运行 ----------
+  //
+  // 实验人员以「唯一运行编号 + 非空设备编号 + 已完成核验编号 + 预约编号」开始一次
+  // 离心运行；开始/结束时间由服务端记录。开始在单个事务内确认：
+  //   1. 核验存在且已完成（核验结论已冻结）；
+  //   2. 核验与生效预约指向同一张发布图；
+  //   3. 发布图当前可用（数据指纹与当前录入一致、图可行）；
+  //   4. 当前时刻处于预约左闭右开时段 [start, end)；
+  //   5. 该预约未被其他运行使用（一个预约至多一次运行）；
+  //   6. 同设备无进行中运行。
+  // 任一冲突即 409 回滚，不留记录。开始后冻结发布图（编号/指纹/快照）、核验结论
+  // 与预约时段。完结填写 completed/aborted，结束时间须晚于开始；超过预约终点仍如实
+  // 完结并标记 timedOut，随即释放设备（部分唯一索引）；不改写预约。
+  // 相同运行编号同开始内容重复提交返回原记录（200），异内容拒绝（409）；
+  // 完结同状态重复提交返回原结果（200），异状态拒绝（409）。
+  // 后续配置、库存或预约状态变化（含取消）均不改写已冻结的运行历史。
+
+  function runView(row, hash, nowMs) {
+    const ended = !!row.ended_at;
+    const reservationEndMs = Date.parse(row.frozen_reservation_end_utc);
+    const reservationStartMs = Date.parse(row.frozen_reservation_start_utc);
+    const view = {
+      id: row.id,
+      runNo: row.run_no,
+      deviceNo: row.device_no,
+      verificationId: row.verification_id,
+      reservationId: row.reservation_id,
+      publicationId: row.publication_id,
+      status: ended ? row.outcome : 'running',
+      outcome: ended ? row.outcome : null,
+      timedOut: !!row.timed_out,
+      startUtc: row.start_utc,
+      endedAt: row.ended_at,
+      createdAt: row.created_at,
+      phase: ended
+        ? 'ended'
+        : nowMs >= reservationEndMs
+          ? 'overrunning'
+          : 'running',
+      // 冻结依据（开始时写入，之后永不改写）
+      frozenBasis: {
+        publication: {
+          id: row.publication_id,
+          basisHash: row.frozen_basis_hash,
+          feasible: !!row.frozen_pub_feasible,
+          // 当前是否仍可用于装载（仅展示用，不影响冻结历史）
+          currentlyUsable:
+            hash !== null &&
+            !!row.frozen_pub_feasible &&
+            row.frozen_basis_hash === hash,
+          config: JSON.parse(row.frozen_pub_config_json),
+          result: JSON.parse(row.frozen_pub_result_json),
+        },
+        verification: {
+          id: row.verification_id,
+          passed: !!row.frozen_verification_passed,
+          diffSum: row.frozen_verification_diff_sum,
+          massSum: row.frozen_verification_mass_sum,
+          checks: row.frozen_verification_checks_json
+            ? JSON.parse(row.frozen_verification_checks_json)
+            : null,
+        },
+        reservation: {
+          id: row.reservation_id,
+          startUtc: row.frozen_reservation_start_utc,
+          endUtc: row.frozen_reservation_end_utc,
+          usage: JSON.parse(row.frozen_reservation_usage_json),
+        },
+        // 展示用：预约当前状态快照（active/cancelled）；预约被取消不改写运行历史
+        reservationCurrentStatus: null,
+      },
+    };
+    const resRow = getReservationRow(db, row.reservation_id);
+    if (resRow) view.frozenBasis.reservationCurrentStatus = resRow.status;
+    // 运行中：now 相对冻结预约窗口的标记（已结束以 timedOut 为准）
+    if (!ended) {
+      view.withinReservationWindow = isWithinReservation(
+        reservationStartMs,
+        reservationEndMs,
+        nowMs,
+      );
+    }
+    return view;
+  }
+
+  // 开始运行：非法输入 400；核验/预约不存在等引用错误 400；状态/冲突类 409。
+  app.post('/api/runs', (req, res, next) => {
+    try {
+      const { errors, clean } = normalizeStartInput(req.body);
+      if (errors.length) throw new ValidationError(errors);
+      const { runNo, deviceNo, verificationId, reservationId } = clean;
+
+      let status = 201;
+      let view;
+      const tx = db.transaction(() => {
+        // 幂等：相同运行编号——开始内容一致返回原记录，不一致拒绝
+        const existing = getRunRowByRunNo(db, runNo);
+        if (existing) {
+          const same =
+            existing.device_no === deviceNo &&
+            existing.verification_id === verificationId &&
+            existing.reservation_id === reservationId;
+          if (!same) {
+            throw new ConflictError(
+              [`运行编号「${runNo}」已被使用且开始内容不同，拒绝重复提交`],
+              { existingId: existing.id },
+            );
+          }
+          view = runView(existing, currentHash(db), Date.now());
+          status = 200;
+          return;
+        }
+
+        // 1. 核验存在且已完成（核验结论已冻结）
+        const verRow = getVerificationRow(db, verificationId);
+        if (!verRow) {
+          throw new ValidationError([`核验记录 #${verificationId} 不存在（未知核验编号）`]);
+        }
+        if (!verRow.completed_at) {
+          throw new ConflictError([
+            `核验 #${verificationId} 尚未完成（核验结论未冻结），不能开始运行；请先完成现场装载核验`,
+          ]);
+        }
+
+        // 2. 预约存在且生效中；核验与预约指向同一张发布图
+        const resRow = getReservationRow(db, reservationId);
+        if (!resRow) {
+          throw new ValidationError([`预约记录 #${reservationId} 不存在（未知预约编号）`]);
+        }
+        if (resRow.status !== 'active') {
+          throw new ConflictError([
+            `预约 #${reservationId} 已取消，不能用于开始离心运行（历史预约保留）`,
+          ]);
+        }
+        if (resRow.publication_id !== verRow.publication_id) {
+          throw new ConflictError([
+            `核验 #${verificationId} 依据发布图 #${verRow.publication_id}，` +
+              `而预约 #${reservationId} 依据发布图 #${resRow.publication_id}，` +
+              '二者必须指向同一张发布图',
+          ]);
+        }
+
+        // 3. 发布图存在、可行且当前可用（数据指纹与当前录入一致）
+        const pub = getPublication(db, verRow.publication_id);
+        if (!pub) {
+          throw new ValidationError([
+            `发布记录 #${verRow.publication_id} 不存在（核验/预约的依据图缺失）`,
+          ]);
+        }
+        if (!pub.feasible) {
+          throw new ConflictError([
+            `发布记录 #${pub.id} 不含可行装载图，不能用于开始运行`,
+          ]);
+        }
+        const hash = currentHash(db);
+        if (hash === null || pub.basisHash !== hash) {
+          throw new ConflictError([
+            `发布记录 #${pub.id} 当前不可用于装载（录入数据已变化），不能开始运行；` +
+              '既有核验与预约保留不变',
+          ]);
+        }
+
+        // 4. 当前时刻处于预约左闭右开时段
+        const nowMs = Date.now();
+        const startMs = Date.parse(resRow.start_utc);
+        const endMs = Date.parse(resRow.end_utc);
+        if (!isWithinReservation(startMs, endMs, nowMs)) {
+          throw new ConflictError([
+            nowMs < startMs
+              ? `当前时刻早于预约开始时间 ${resRow.start_utc}，运行尚未到开始时段`
+              : `当前时刻已到/超过预约终点 ${resRow.end_utc}（时段左闭右开），不能开始运行`,
+          ]);
+        }
+
+        // 5. 预约未被其他运行使用（UNIQUE 索引兜底，此处给出可读冲突）
+        const usedBy = getRunRowByReservation(db, reservationId);
+        if (usedBy) {
+          throw new ConflictError([
+            `预约 #${reservationId} 已用于运行 #${usedBy.id}（运行编号「${usedBy.run_no}」），` +
+              '一个预约至多开始一次运行',
+          ], { existingRunId: usedBy.id });
+        }
+
+        // 6. 同设备无进行中运行（部分唯一索引兜底，此处给出可读冲突）
+        const activeOnDevice = getActiveRunRowByDevice(db, deviceNo);
+        if (activeOnDevice) {
+          throw new ConflictError([
+            `设备「${deviceNo}」存在进行中的运行 #${activeOnDevice.id}` +
+              `（运行编号「${activeOnDevice.run_no}」），请先完结该运行再开始新运行`,
+          ], { existingRunId: activeOnDevice.id });
+        }
+
+        const row = insertRun(db, {
+          runNo,
+          deviceNo,
+          verificationId,
+          reservationId,
+          publicationId: pub.id,
+          startUtc: toIso(nowMs),
+          basisHash: pub.basisHash,
+          pubFeasible: pub.feasible,
+          pubConfig: pub.config,
+          pubResult: pub.result,
+          verificationPassed: true, // 完成核验方可到达此处；结论随运行冻结
+          verificationDiffSum: verRow.diff_sum,
+          verificationMassSum: verRow.mass_sum,
+          verificationChecks: verRow.checks_json ? JSON.parse(verRow.checks_json) : null,
+          reservationStartUtc: resRow.start_utc,
+          reservationEndUtc: resRow.end_utc,
+          reservationUsage: JSON.parse(resRow.usage_json),
+        });
+        view = runView(row, hash, nowMs);
+      });
+      tx();
+      res.status(status).json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get('/api/runs', (req, res) => {
+    const hash = currentHash(db);
+    const nowMs = Date.now();
+    res.json(listRunRows(db).map((r) => runView(r, hash, nowMs)));
+  });
+
+  app.get('/api/runs/:id', (req, res, next) => {
+    const row = getRunRow(db, Number(req.params.id));
+    if (!row) return res.status(404).json({ error: '运行记录不存在' });
+    res.json(runView(row, currentHash(db), Date.now()));
+  });
+
+  // 完结运行：body.outcome = completed | aborted；结束时间由服务端记录且须晚于开始。
+  // 超过预约终点仍如实完结并标记 timedOut；随即释放设备，不改写预约。
+  // 重复提交：相同 outcome 返回原结果（200）；不同 outcome 拒绝（409）。
+  app.post('/api/runs/:id/complete', (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const existed = getRunRow(db, id);
+      if (!existed) return res.status(404).json({ error: '运行记录不存在' });
+      const { errors, clean } = normalizeCompleteInput(req.body);
+      if (errors.length) throw new ValidationError(errors);
+      const { outcome } = clean;
+
+      let status = 200;
+      let view;
+      const tx = db.transaction(() => {
+        const row = getRunRow(db, id);
+        if (row.ended_at) {
+          // 幂等：同完结状态返回原结果；异状态拒绝
+          if (row.outcome !== outcome) {
+            throw new ConflictError([
+              `运行 #${id} 已完结为「${row.outcome === 'completed' ? '完成' : '中止'}」，` +
+                `不能改报为「${outcome === 'completed' ? '完成' : '中止'}」（完结状态已冻结）`,
+            ], { existingOutcome: row.outcome });
+          }
+          view = runView(row, currentHash(db), Date.now());
+          status = 200;
+          return;
+        }
+
+        const endMs = Date.now();
+        const startMs = Date.parse(row.start_utc);
+        if (!(endMs > startMs)) {
+          // 服务端时钟异常或与开始落在同一毫秒：拒绝并保持运行进行中
+          throw new ConflictError([
+            '结束时间未晚于开始时间（服务端时钟与开始时刻相同），请稍后重试完结',
+          ]);
+        }
+        const timedOut = isOverrun(Date.parse(row.frozen_reservation_end_utc), endMs);
+        const updated = completeRun(db, id, {
+          outcome,
+          endUtc: toIso(endMs),
+          timedOut,
+        });
+        if (!updated) {
+          // 并发：刚被其他请求完结
+          const fresh = getRunRow(db, id);
+          throw new ConflictError(
+            [fresh ? `运行 #${id} 已被完结为「${fresh.outcome}」` : `运行 #${id} 状态已变化`],
+            fresh ? { existingOutcome: fresh.outcome } : {},
+          );
+        }
+        view = runView(updated, currentHash(db), endMs);
+        status = 201;
+      });
+      tx();
+      res.status(status).json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
   // ---------- 静态前端 ----------
 
   app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -1018,6 +1325,8 @@ export function createApp(db) {
         error: err.message,
         errors: err.errors,
         ...(err.existingId != null ? { existingId: err.existingId } : {}),
+        ...(err.existingRunId != null ? { existingRunId: err.existingRunId } : {}),
+        ...(err.existingOutcome != null ? { existingOutcome: err.existingOutcome } : {}),
         ...(err.completed != null ? { completed: err.completed } : {}),
         ...(err.currentVersion != null ? { currentVersion: err.currentVersion } : {}),
         ...(err.detail ? { detail: err.detail } : {}),

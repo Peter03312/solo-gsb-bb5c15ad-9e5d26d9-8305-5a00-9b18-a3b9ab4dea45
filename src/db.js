@@ -132,6 +132,47 @@ CREATE TABLE IF NOT EXISTS verifications (
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (publication_id) REFERENCES publications(id)
 );
+
+-- 离心运行：以唯一运行编号开始；开始/结束时间由服务端记录。
+-- 开始事务内确认核验通过、核验与预约同指一张发布图、发布图当前可用、
+-- 当前时刻位于预约左闭右开时段、预约未被其他运行占用、同设备无进行中运行，
+-- 通过后冻结发布图编号/数据指纹、核验编号与结论、预约编号与时段。
+-- 完结仅置 outcome/ended_at/timed_out；不改写预约、不回填任何冻结列。
+-- reservation_id 全局唯一：一个预约至多被一条运行使用；
+-- 同设备「进行中（ended_at IS NULL）」至多一条由部分唯一索引兜底。
+CREATE TABLE IF NOT EXISTS runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_no TEXT NOT NULL UNIQUE,
+  device_no TEXT NOT NULL,
+  verification_id INTEGER NOT NULL,
+  reservation_id INTEGER NOT NULL,
+  publication_id INTEGER NOT NULL,
+  start_utc TEXT NOT NULL,
+  ended_at TEXT,
+  outcome TEXT CHECK (outcome IS NULL OR outcome IN ('completed', 'aborted')),
+  timed_out INTEGER NOT NULL DEFAULT 0,
+  -- 冻结依据（开始时写入，之后永不改写）
+  frozen_basis_hash TEXT NOT NULL,
+  frozen_pub_feasible INTEGER NOT NULL,
+  frozen_pub_config_json TEXT NOT NULL,
+  frozen_pub_result_json TEXT NOT NULL,
+  frozen_verification_passed INTEGER NOT NULL,
+  frozen_verification_diff_sum REAL,
+  frozen_verification_mass_sum REAL,
+  frozen_verification_checks_json TEXT,
+  frozen_reservation_start_utc TEXT NOT NULL,
+  frozen_reservation_end_utc TEXT NOT NULL,
+  frozen_reservation_usage_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (verification_id) REFERENCES verifications(id),
+  FOREIGN KEY (reservation_id) REFERENCES reservations(id),
+  FOREIGN KEY (publication_id) REFERENCES publications(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_reservation
+  ON runs (reservation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_device_active
+  ON runs (device_no) WHERE ended_at IS NULL;
 `;
 
 // ---------- 读取 ----------
@@ -449,4 +490,79 @@ export function listVerificationRows(db) {
         ORDER BY v.id DESC`,
     )
     .all();
+}
+
+// ---------- 离心运行（由 server 在单事务内调用） ----------
+
+export function getRunRow(db, id) {
+  return db.prepare('SELECT * FROM runs WHERE id = ?').get(id);
+}
+
+export function getRunRowByRunNo(db, runNo) {
+  return db.prepare('SELECT * FROM runs WHERE run_no = ?').get(runNo);
+}
+
+export function getRunRowByReservation(db, reservationId) {
+  return db.prepare('SELECT * FROM runs WHERE reservation_id = ?').get(reservationId);
+}
+
+export function getActiveRunRowByDevice(db, deviceNo) {
+  return db
+    .prepare('SELECT * FROM runs WHERE device_no = ? AND ended_at IS NULL')
+    .get(deviceNo);
+}
+
+export function listRunRows(db) {
+  return db.prepare('SELECT * FROM runs ORDER BY start_utc DESC, id DESC').all();
+}
+
+// 开始运行：冻结依据快照在同一事务内写入（basis 字段由 server 收集）。
+export function insertRun(db, b) {
+  const info = db
+    .prepare(
+      `INSERT INTO runs (
+         run_no, device_no, verification_id, reservation_id, publication_id,
+         start_utc,
+         frozen_basis_hash, frozen_pub_feasible,
+         frozen_pub_config_json, frozen_pub_result_json,
+         frozen_verification_passed, frozen_verification_diff_sum,
+         frozen_verification_mass_sum, frozen_verification_checks_json,
+         frozen_reservation_start_utc, frozen_reservation_end_utc,
+         frozen_reservation_usage_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      b.runNo,
+      b.deviceNo,
+      b.verificationId,
+      b.reservationId,
+      b.publicationId,
+      b.startUtc,
+      b.basisHash,
+      b.pubFeasible ? 1 : 0,
+      JSON.stringify(b.pubConfig),
+      JSON.stringify(b.pubResult),
+      b.verificationPassed ? 1 : 0,
+      b.verificationDiffSum ?? null,
+      b.verificationMassSum ?? null,
+      b.verificationChecks === undefined
+        ? null
+        : JSON.stringify(b.verificationChecks ?? null),
+      b.reservationStartUtc,
+      b.reservationEndUtc,
+      JSON.stringify(b.reservationUsage ?? []),
+    );
+  return getRunRow(db, info.lastInsertRowid);
+}
+
+// 完结：条件更新保证幂等与状态约束（仅进行中可完结）。
+export function completeRun(db, id, { outcome, endUtc, timedOut }) {
+  const info = db
+    .prepare(
+      `UPDATE runs
+          SET outcome = ?, ended_at = ?, timed_out = ?
+        WHERE id = ? AND ended_at IS NULL AND outcome IS NULL`,
+    )
+    .run(outcome, endUtc, timedOut ? 1 : 0, id);
+  return info.changes === 1 ? getRunRow(db, id) : null;
 }

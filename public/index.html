@@ -201,6 +201,39 @@
       <h3>停用记录（含已撤销历史）</h3>
       <div id="sus-list"></div>
     </section>
+
+    <section class="card" id="sec-runs">
+      <h2>11. 离心运行</h2>
+      <div class="muted" style="margin-bottom:10px">
+        以<b>唯一运行编号 + 非空设备编号 + 已完成核验编号 + 预约编号</b>开始一次离心运行；
+        开始/结束时间由服务端记录。开始时在事务内确认：核验已通过、核验与生效预约指向
+        <b>同一张发布图</b>、发布图<b>当前可用</b>、当前时刻处于预约
+        <b>左闭右开 [开始, 结束)</b> 时段、该预约未被其他运行使用、同设备无进行中运行；
+        任一冲突即拒绝且不留记录。开始后冻结发布图、核验结论与预约时段；完结如实填写
+        「完成 / 中止」，超过预约终点完结会标记<b>超时</b>，随即释放设备，不改写预约。
+        相同运行编号同内容重复提交返回原记录，异内容拒绝；完结同状态重放返回原结果。
+      </div>
+      <div class="form-row">
+        <label>运行编号（唯一）
+          <input id="run-no" type="text" placeholder="如 RUN-2026-001" />
+        </label>
+        <label>设备编号（非空）
+          <input id="run-device" type="text" placeholder="如 CENT-01" />
+        </label>
+        <label>已完成核验编号
+          <select id="run-ver"></select>
+        </label>
+        <label>预约编号（生效中）
+          <select id="run-res"></select>
+        </label>
+      </div>
+      <div class="actions">
+        <button id="run-start" class="primary">开始离心运行</button>
+      </div>
+      <div id="run-conflict"></div>
+      <h3>运行列表（含运行状态、超时标记与冻结依据）</h3>
+      <div id="run-list"></div>
+    </section>
   </main>
 
   <dialog id="pub-dialog">
@@ -217,6 +250,14 @@
       <button id="ver-close" class="icon-btn">✕</button>
     </div>
     <div id="ver-detail"></div>
+  </dialog>
+
+  <dialog id="run-dialog">
+    <div class="dialog-head">
+      <h3 id="run-title"></h3>
+      <button id="run-detail-close" class="icon-btn">✕</button>
+    </div>
+    <div id="run-detail"></div>
   </dialog>
 
   <script src="app.js"></script>
